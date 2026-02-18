@@ -1,4 +1,4 @@
-"""
+﻿"""
 Q2: NIPT timing optimization by BMI groups.
 
 Reference: lambda search for K (lam_hi 0.30), grid [10,28], conservative correction
@@ -13,7 +13,6 @@ import q1_lmm
 
 COL_GA = "检测孕周"
 COL_BMI = "孕妇BMI"
-
 THETA_FF = 0.04
 K_SEG = 5
 LAM_HI = 0.30
@@ -34,22 +33,21 @@ def make_p_kappa(result, ga_bar, bmi_bar, kappa=1.0):
     y_thresh = np.log(THETA_FF / (1.0 - THETA_FF))
     sd_eta = np.sqrt(scale) * kappa
 
-    def x_row(ga, bmi):
-        ga_c = ga - ga_bar
-        bmi_c = bmi - bmi_bar
-        return np.array([1.0, ga_c, ga_c ** 2, bmi_c, bmi_c ** 2])
-
     def p_kappa(t, b):
-        t_arr = np.atleast_1d(np.asarray(t, dtype=float))
-        b_arr = np.atleast_1d(np.asarray(b, dtype=float))
+        t_arr = np.asarray(t, dtype=float)
+        b_arr = np.asarray(b, dtype=float)
         t_arr, b_arr = np.broadcast_arrays(t_arr, b_arr)
-        out = np.empty(t_arr.size)
-        for idx in range(t_arr.size):
-            tt, bb = t_arr.flat[idx], b_arr.flat[idx]
-            x = x_row(tt, bb).reshape(1, -1)
-            eta = (x @ beta)[0]
-            out.flat[idx] = 1.0 - stats.norm.cdf((y_thresh - eta) / sd_eta)
-        return out.reshape(t_arr.shape) if out.size > 1 else float(out.flat[0])
+        ga_c = t_arr - ga_bar
+        bmi_c = b_arr - bmi_bar
+        eta = (
+            beta[0]
+            + beta[1] * ga_c
+            + beta[2] * (ga_c ** 2)
+            + beta[3] * bmi_c
+            + beta[4] * (bmi_c ** 2)
+        )
+        z = (y_thresh - eta) / sd_eta
+        return 1.0 - stats.norm.cdf(z)
 
     return p_kappa
 
@@ -86,16 +84,13 @@ def discretize_bmi_t(bmi_min, bmi_max):
 def compute_T_star_curve(b_grid, t_grid, p_kappa, q):
     """For each BMI point b, compute T*(b) = earliest t such that p(t,b) >= q; else t_max.
     Return T_curve (monotonic), raw T_star, and P matrix."""
-    n = len(b_grid)
-    n_t = len(t_grid)
-    P = np.zeros((n_t, n))
-    for ti in range(n_t):
-        for bi in range(n):
-            P[ti, bi] = p_kappa(t_grid[ti], b_grid[bi])
-    T_star = np.empty(n)
-    for bi in range(n):
-        idx = next((i for i in range(n_t) if P[i, bi] >= q), n_t - 1)
-        T_star[bi] = t_grid[idx]
+    t_grid = np.asarray(t_grid, dtype=float)
+    b_grid = np.asarray(b_grid, dtype=float)
+    P = p_kappa(t_grid[:, None], b_grid[None, :])
+    mask = P >= q
+    any_mask = mask.any(axis=0)
+    idx = np.where(any_mask, mask.argmax(axis=0), len(t_grid) - 1)
+    T_star = t_grid[idx]
     T_curve = np.maximum.accumulate(T_star)
     return T_curve, T_star, P
 
@@ -125,14 +120,13 @@ def apply_conservative_correction(b_grid, breakpoints, segment_times, T_final):
 def precompute_costs(b_grid, t_grid, w, p_kappa, q):
     """Precompute cost and recommended time for each segment [i:j).
     
-    For each segment, finds time t that minimizes cost = Σ_{k=i}^j w(k)[r_fail(t,b(k)) + φ(t)].
+    For each segment, finds time t that minimizes cost = 危_{k=i}^j w(k)[r_fail(t,b(k)) + 蠁(t)].
     Uses precomputed P matrix for efficient computation.
     
     IMPORTANT: Only considers time points t that satisfy the coverage constraint:
-    min_{k∈[i:j]} P_K(t, b(k)) ≥ q (constraint from Step2 in reference).
+    min_{k鈭圼i:j]} P_K(t, b(k)) 鈮?q (constraint from Step2 in reference).
     """
     n = len(b_grid)
-    n_t = len(t_grid)
     _, _, P = compute_T_star_curve(b_grid, t_grid, p_kappa, q)
     best_cost = np.full((n + 1, n + 1), np.inf)
     best_t = np.full((n + 1, n + 1), np.nan)
@@ -142,87 +136,16 @@ def precompute_costs(b_grid, t_grid, w, p_kappa, q):
         for j in range(i + 1, n + 1):
             w_seg = w[i:j]
             w_sum = float(np.sum(w_seg))
-            cost_vec = np.full(n_t, np.inf)  # Initialize with inf for invalid time points
-            for ti in range(n_t):
-                p_seg = P[ti, i:j]
-                # Check coverage constraint: min_{k∈[i:j]} P_K(t, b(k)) ≥ q
-                min_p = float(np.min(p_seg))
-                if min_p < q:
-                    continue  # Skip this time point if constraint not satisfied
-                sum_w_p = float(np.sum(w_seg * p_seg))
-                cost_vec[ti] = w_sum - sum_w_p + w_sum * phi_t[ti]
+            p_seg = P[:, i:j]
+            min_p_per_t = np.min(p_seg, axis=1)
+            sum_w_p = p_seg @ w_seg
+            cost_vec = w_sum - sum_w_p + w_sum * phi_t
+            cost_vec[min_p_per_t < q] = np.inf
             if np.any(np.isfinite(cost_vec)):
                 ti_best = np.argmin(cost_vec)
                 best_cost[i, j] = cost_vec[ti_best]
                 best_t[i, j] = float(t_grid[ti_best])
     return best_cost, best_t
-
-
-def dp_solve(n, K, best_cost, best_t):
-    """Dynamic programming to find optimal K-segment partition of BMI range.
-    
-    DP[j,s] = minimum cost to partition first j points into s segments.
-    DP[j,s] = min_{i} [DP[i,s-1] + best_cost[i+1,j]] with monotonicity constraint.
-    """
-    min_seg = max(MIN_SEG_LEN, n // 15)
-    DP = np.full((n + 1, K + 1), np.inf)
-    DP[0, 0] = 0.0
-    parent = np.full((n + 1, K + 1), -1, dtype=int)
-    last_t = np.full((n + 1, K + 1), np.nan)
-
-    for j in range(min_seg, n + 1):
-        DP[j, 1] = best_cost[0, j]
-        parent[j, 1] = -1
-        last_t[j, 1] = best_t[0, j]
-
-    for s in range(2, K + 1):
-        for j in range(s * min_seg, n + 1):
-            best_val = np.inf
-            best_i = -1
-            for i in range((s - 1) * min_seg, j - min_seg):
-                if not np.isfinite(DP[i, s - 1]):
-                    continue
-                t_prev = last_t[i, s - 1]
-                t_curr = best_t[i + 1, j]
-                if t_curr < t_prev:
-                    continue
-                cand = DP[i, s - 1] + best_cost[i + 1, j]
-                if cand < best_val:
-                    best_val = cand
-                    best_i = i
-            if best_i >= 0:
-                DP[j, s] = best_val
-                parent[j, s] = best_i
-                last_t[j, s] = best_t[best_i + 1, j]
-
-    def backtrack(j_final, s_final):
-        """Reconstruct segment breakpoints from DP parent pointers."""
-        bp_list = []
-        j = j_final
-        for s in range(s_final, 0, -1):
-            i = parent[j, s]
-            if i == -1:
-                break
-            bp_list.append(i + 1)
-            j = i
-        bp_list.reverse()
-        breakpoints = [0] + bp_list + [j_final]
-        result = [int(breakpoints[0])]
-        for bp in breakpoints[1:]:
-            if int(bp) != result[-1]:
-                result.append(int(bp))
-        return result
-
-    breakpoints = backtrack(n, K)
-    while len(breakpoints) < K + 1:
-        breakpoints.append(n)
-
-    segment_times = []
-    for idx in range(K):
-        i_start, i_end = int(breakpoints[idx]), int(breakpoints[idx + 1])
-        segment_times.append(float(best_t[i_start, i_end]))
-    segment_times = enforce_monotonicity(segment_times)
-    return float(DP[n, K]), breakpoints, segment_times
 
 
 def dp_solve_with_penalty(n, best_cost, best_t, lam):
@@ -299,7 +222,6 @@ def segment_stats(b_grid, breakpoints, segment_times, p_kappa, w):
     """For each segment, compute mean coverage and mean risk (1 - p_kappa + phi)."""
     K = len(segment_times)
     stats_list = []
-    n = len(b_grid)
     for s in range(K):
         i_start, i_end = int(breakpoints[s]), int(breakpoints[s + 1])
         if i_end <= i_start:
@@ -346,7 +268,7 @@ def sensitivity_analysis(result, ga_bar, bmi_bar, b_grid, w):
     """Sensitivity analysis: vary q (0.95, 0.98) and kappa (0.75, 1.0, 1.25, 1.5).
     
     For each combination, solve for optimal segments and compute average recommended GA.
-    Report Δt relative to baseline (kappa=1.0, q=0.95).
+    Report 螖t relative to baseline (kappa=1.0, q=0.95).
     """
     t_grid = get_t_grid(T_MAX)
     q_values = [0.95, 0.98]
@@ -355,20 +277,20 @@ def sensitivity_analysis(result, ga_bar, bmi_bar, b_grid, w):
     baseline_q = 0.95
     baseline_kappa = 1.0
     p_kappa_baseline = make_p_kappa(result, ga_bar, bmi_bar, kappa=baseline_kappa)
-    _, segment_times_baseline, stats_list_baseline = run_one_solve(
+    _, _, stats_list_baseline = run_one_solve(
         b_grid, t_grid, w, p_kappa_baseline, baseline_q
     )
     ts_baseline = [row["t_s"] for row in stats_list_baseline]
     baseline_avg_ga = float(np.average(ts_baseline))
     
-    print("\nSensitivity (q and κ)")
-    print(f"{'q':<8}{'κ':<8}{'Segments':<10}{'Avg Rec. GA (wk)':<18}{'Δt (wk)':<12}")
+    print("\nSensitivity (q and 魏)")
+    print(f"{'q':<8}{'魏':<8}{'Segments':<10}{'Avg Rec. GA (wk)':<18}{'螖t (wk)':<12}")
     print("-" * 56)
     
     for q in q_values:
         for kappa in kappa_values:
             p_kappa = make_p_kappa(result, ga_bar, bmi_bar, kappa=kappa)
-            _, segment_times, stats_list = run_one_solve(b_grid, t_grid, w, p_kappa, q)
+            _, _, stats_list = run_one_solve(b_grid, t_grid, w, p_kappa, q)
             ts = [row["t_s"] for row in stats_list]
             avg_ga = float(np.average(ts))
             delta_t = avg_ga - baseline_avg_ga
@@ -388,12 +310,13 @@ def main():
     n = len(b_grid)
     w = np.ones(n) / n
     p_kappa = make_p_kappa(result, ga_bar, bmi_bar, kappa=1.0)
-    breakpoints, segment_times, stats_list = run_one_solve(
+    _, _, stats_list = run_one_solve(
         b_grid, t_grid, w, p_kappa, q_main
     )
-    print_results(stats_list, f"NIPT groups (q={q_main}, κ=1)")
+    print_results(stats_list, f"NIPT groups (q={q_main}, 魏=1)")
     sensitivity_analysis(result, ga_bar, bmi_bar, b_grid, w)
 
 
 if __name__ == "__main__":
     main()
+
