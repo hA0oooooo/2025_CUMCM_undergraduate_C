@@ -1,7 +1,16 @@
+﻿"""
+Q4: statistical classification model for sex-chromosome-related aneuploidy screening.
+
+summary:
+1) Train four binary expert models (T13/T18/T21/complex).
+2) Build stacked meta features and train an eight-class meta classifier.
+3) Apply rule-based logic correction and report binary/multiclass metrics.
+"""
 from __future__ import annotations
 
 import os
 import pickle
+import sqlite3
 from pathlib import Path
 from typing import Dict, Tuple
 
@@ -17,8 +26,9 @@ from sklearn.preprocessing import StandardScaler
 
 ROOT = Path(__file__).resolve().parent
 DATA_PATH = ROOT / "data" / "girl.csv"
-OPTUNA_DB_PATH = ROOT / "data" / "q4_optuna_studies.db"
-MODEL_DIR = ROOT / "data" / "q4_models"
+Q4_DIR = ROOT / "data" / "q4"
+OPTUNA_DB_PATH = Q4_DIR / "optuna_studies.db"
+MODEL_BUNDLE_PATH = Q4_DIR / "model_bundle.pkl"
 OPTUNA_STORAGE = f"sqlite:///{OPTUNA_DB_PATH.as_posix()}"
 
 COL_SUBJECT = "孕妇代码"
@@ -101,12 +111,18 @@ N_META_RFE_SUPP = 8
 EARLY_STOPPING_ROUNDS = 50
 SMOTE_META_RATIO = 0.5
 LOGIC_Z_THRESHOLD = 3.0
-STUDY_PREFIX = "q4_ref_v2"
+STUDY_PREFIX = "q4_girl"
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 
+def ensure_q4_output_dir():
+    # Create the unified q4 output directory for both Optuna state and model artifacts.
+    Q4_DIR.mkdir(parents=True, exist_ok=True)
+
+
 def parse_gestational_week(value) -> float:
+    # Normalize heterogeneous gestational-age strings into a single float week unit.
     if pd.isna(value):
         return np.nan
     s = str(value).strip().lower()
@@ -130,6 +146,7 @@ def parse_gestational_week(value) -> float:
 
 
 def parse_ivf_flag(value) -> int:
+    # Map multiple textual IVF markers to a stable binary flag.
     if pd.isna(value):
         return 0
     s = str(value).strip().lower()
@@ -139,18 +156,21 @@ def parse_ivf_flag(value) -> int:
 
 
 def ab_to_flags(ab_value: str) -> Tuple[int, int, int]:
+    # Convert the composite abnormality string into chromosome-specific binary indicators.
     s = str(ab_value).strip().upper()
     return int("T13" in s), int("T18" in s), int("T21" in s)
 
 
 def build_modeling_data(df_raw: pd.DataFrame):
     df = df_raw.copy()
+    # Split the raw abnormality label into three chromosome-wise binary flags.
     t13, t18, t21 = zip(*df[COL_AB].apply(ab_to_flags))
     df["is_abnormal_13"] = np.array(t13, dtype=int)
     df["is_abnormal_18"] = np.array(t18, dtype=int)
     df["is_abnormal_21"] = np.array(t21, dtype=int)
     df["is_multi_abnormal"] = (df["is_abnormal_13"] + df["is_abnormal_18"] + df["is_abnormal_21"] >= 2).astype(int)
 
+    # Try direct numeric parsing first, then fall back to custom gestational-week parsing.
     ga_num = pd.to_numeric(df[COL_GA], errors="coerce")
     ga_num = ga_num.fillna(df[COL_GA].apply(parse_gestational_week))
 
@@ -178,6 +198,7 @@ def build_modeling_data(df_raw: pd.DataFrame):
         "parity_times": pd.to_numeric(df[COL_PARITY_TIMES], errors="coerce"),
     })
 
+    # Build a unified feature matrix with raw, transformed, and interaction features.
     x = pd.DataFrame({
         "age": numeric["age"],
         "height": numeric["height"],
@@ -216,6 +237,7 @@ def build_modeling_data(df_raw: pd.DataFrame):
         "gc21_minus_gc": numeric["gc21"] - numeric["gc"],
     })
 
+    # Encode the 3-bit abnormality state into one multiclass label.
     target_code = (
         df["is_abnormal_21"] * 4
         + df["is_abnormal_18"] * 2
@@ -224,6 +246,7 @@ def build_modeling_data(df_raw: pd.DataFrame):
     target_name = target_code.map(STATE_CODE_TO_NAME)
     y_idx = target_name.map(CLASS_TO_INDEX).to_numpy(dtype=int)
 
+    # Drop rows missing critical modeling features before any training step.
     key_cols = ["age", "bmi", "ga", "z13", "z18", "z21", "zx", "gc", "reads_log", "unique_log"]
     keep_mask = ~x[key_cols].isna().any(axis=1)
     x = x.loc[keep_mask].reset_index(drop=True)
@@ -232,6 +255,7 @@ def build_modeling_data(df_raw: pd.DataFrame):
     target_df = df[["is_abnormal_13", "is_abnormal_18", "is_abnormal_21", "is_multi_abnormal"]].astype(int)
 
     x = x.apply(pd.to_numeric, errors="coerce")
+    # Use column medians for the remaining non-critical missing values to keep the pipeline runnable.
     x = x.fillna(x.median(numeric_only=True))
     return x, y_idx, target_df
 
@@ -241,11 +265,15 @@ def get_cv_splitter(y: np.ndarray, n_splits: int, seed: int):
     min_count = int(counts.min())
     if min_count >= 2:
         folds = max(2, min(n_splits, min_count))
+        # Use stratified CV when every class has enough samples.
         return StratifiedKFold(n_splits=folds, shuffle=True, random_state=seed), True
+    # Fall back to plain KFold when stratification is infeasible for rare classes.
     return KFold(n_splits=2, shuffle=True, random_state=seed), False
 
 
 def create_or_load_study(study_name: str, seed: int):
+    # Persist Optuna studies in sqlite so repeated runs can reuse completed trials.
+    ensure_q4_output_dir()
     return optuna.create_study(
         direction="minimize",
         study_name=study_name,
@@ -257,6 +285,7 @@ def create_or_load_study(study_name: str, seed: int):
 
 
 def expand_proba_to_all_classes(proba: np.ndarray, classes_: np.ndarray):
+    # Align model probability outputs to the fixed global class order used by reports.
     full = np.zeros((proba.shape[0], len(CLASS_NAMES)), dtype=float)
     full[:, classes_.astype(int)] = proba
     return full
@@ -270,14 +299,17 @@ def smote_resample_multiclass(x: pd.DataFrame, y: np.ndarray, seed: int):
     sampling_strategy = {}
     for cls, cnt in class_counts.items():
         if int(cnt) > 1 and int(cnt) < majority_count:
+            # Upsample minority classes only to a controlled ratio of the majority class.
             sampling_strategy[int(cls)] = max(int(cnt), int(majority_count * SMOTE_META_RATIO))
     if not sampling_strategy:
         return x.copy(), y.copy()
     try:
+        # Use k_neighbors=1 to remain stable when minority classes are very small.
         smote = SMOTE(random_state=seed, k_neighbors=1, sampling_strategy=sampling_strategy)
         x_res, y_res = smote.fit_resample(x, y)
         return pd.DataFrame(x_res, columns=x.columns), y_res
     except ValueError:
+        # Gracefully skip resampling if SMOTE cannot be applied on the current split.
         return x.copy(), y.copy()
 
 
@@ -306,6 +338,7 @@ def tune_single_expert(x: pd.DataFrame, y: np.ndarray, study_name: str, seed: in
         losses = []
         split_iter = cv.split(x, y) if is_stratified else cv.split(x)
         for step, (idx_tr, idx_va) in enumerate(split_iter, start=1):
+            # Each trial is evaluated by CV logloss to reduce overfitting to a single split.
             model = lgb.LGBMClassifier(**params, random_state=seed + step)
             model.fit(
                 x.iloc[idx_tr],
@@ -318,6 +351,7 @@ def tune_single_expert(x: pd.DataFrame, y: np.ndarray, study_name: str, seed: in
             losses.append(log_loss(y[idx_va], pred, labels=[0, 1]))
             trial.report(float(np.mean(losses)), step=step)
             if trial.should_prune():
+                # Prune weak trials early to reduce tuning time.
                 raise optuna.TrialPruned()
         return float(np.mean(losses)) if losses else 999.0
 
@@ -336,6 +370,7 @@ def tune_single_expert(x: pd.DataFrame, y: np.ndarray, study_name: str, seed: in
         "n_jobs": -1,
         "is_unbalance": True,
     })
+    # Refit the expert on the full input using the best Optuna parameters.
     final_model = lgb.LGBMClassifier(**best_params, random_state=seed)
     final_model.fit(x, y)
     return final_model, best_params
@@ -344,6 +379,7 @@ def tune_single_expert(x: pd.DataFrame, y: np.ndarray, study_name: str, seed: in
 def train_expert_models(x: pd.DataFrame, target_df: pd.DataFrame, seed: int, study_tag: str):
     experts = {}
     best_param_map = {}
+    # Train one binary expert per task and keep both fitted models and tuned parameters.
     for k, cfg in EXPERT_CONFIG.items():
         y = target_df[cfg["target"]].to_numpy(dtype=int)
         study_name = f"{STUDY_PREFIX}_{study_tag}_expert_{k}"
@@ -356,6 +392,7 @@ def train_expert_models(x: pd.DataFrame, target_df: pd.DataFrame, seed: int, stu
 
 def build_meta_probs_from_experts(x: pd.DataFrame, experts: Dict[str, dict]):
     meta = pd.DataFrame(index=x.index)
+    # Stack expert probabilities as the first block of meta-model features.
     for k, cfg in EXPERT_CONFIG.items():
         model = experts[k]["model"]
         meta[cfg["prob_col"]] = model.predict_proba(x)[:, 1]
@@ -370,6 +407,7 @@ def build_oof_meta_features(x: pd.DataFrame, target_df: pd.DataFrame, expert_par
         split_iter = cv.split(x, y) if is_stratified else cv.split(x)
         oof_pred = np.zeros(len(x), dtype=float)
         for fold, (idx_tr, idx_va) in enumerate(split_iter, start=1):
+            # Generate out-of-fold expert probabilities to build leakage-free meta features.
             model = lgb.LGBMClassifier(**expert_param_map[k], random_state=seed + i * 100 + fold)
             model.fit(x.iloc[idx_tr], y[idx_tr])
             oof_pred[idx_va] = model.predict_proba(x.iloc[idx_va])[:, 1]
@@ -383,6 +421,7 @@ def select_meta_original_features(x: pd.DataFrame, y_idx: np.ndarray, seed: int)
     selected_supp = []
     if remaining:
         n_select = min(N_META_RFE_SUPP, len(remaining))
+        # RFE keeps a compact supplementary subset beyond the fixed core meta features.
         estimator = lgb.LGBMClassifier(
             objective="multiclass",
             num_class=len(CLASS_NAMES),
@@ -425,6 +464,7 @@ def tune_meta_model(x_meta: pd.DataFrame, y_idx: np.ndarray, study_name: str, se
         for step, (idx_tr, idx_va) in enumerate(split_iter, start=1):
             x_tr = x_meta.iloc[idx_tr].reset_index(drop=True)
             y_tr = y_idx[idx_tr]
+            # Apply controlled SMOTE only on the training fold of each CV split.
             x_tr_smote, y_tr_smote = smote_resample_multiclass(x_tr, y_tr, seed + step)
             if np.unique(y_tr_smote).shape[0] < 2:
                 return 999.0
@@ -433,6 +473,7 @@ def tune_meta_model(x_meta: pd.DataFrame, y_idx: np.ndarray, study_name: str, se
             train_labels = np.unique(y_tr_smote)
             val_labels = np.unique(y_va)
             if np.setdiff1d(val_labels, train_labels).size == 0:
+                # Use early stopping only when validation classes are all seen in training.
                 model.fit(
                     x_tr_smote,
                     y_tr_smote,
@@ -465,6 +506,7 @@ def tune_meta_model(x_meta: pd.DataFrame, y_idx: np.ndarray, study_name: str, se
         "verbosity": -1,
         "n_jobs": -1,
     })
+    # Refit the meta model on the full meta-feature matrix after controlled resampling.
     x_final, y_final = smote_resample_multiclass(x_meta, y_idx, seed + 999)
     final_model = lgb.LGBMClassifier(**best_params, random_state=seed)
     final_model.fit(x_final, y_final)
@@ -482,6 +524,7 @@ def apply_logic_correction(y_pred: np.ndarray, x_base: pd.DataFrame):
     idx_t13t21 = CLASS_TO_INDEX["T13T21"]
     idx_t18t21 = CLASS_TO_INDEX["T18T21"]
 
+    # Apply deterministic rule overrides using chromosome Z-score thresholds.
     mask_3 = (z13 >= LOGIC_Z_THRESHOLD) & (z18 >= LOGIC_Z_THRESHOLD) & (z21 >= LOGIC_Z_THRESHOLD)
     mask_13_18 = (z13 >= LOGIC_Z_THRESHOLD) & (z18 >= LOGIC_Z_THRESHOLD) & (~mask_3)
     mask_13_21 = (z13 >= LOGIC_Z_THRESHOLD) & (z21 >= LOGIC_Z_THRESHOLD) & (~mask_3)
@@ -495,6 +538,7 @@ def apply_logic_correction(y_pred: np.ndarray, x_base: pd.DataFrame):
 
 
 def build_meta_input_for_prediction(x: pd.DataFrame, experts: Dict[str, dict], selected_original_cols: list[str]):
+    # Recreate the training-time meta feature layout for inference and evaluation.
     meta_probs = build_meta_probs_from_experts(x, experts)
     return pd.concat([meta_probs, x[selected_original_cols]], axis=1)
 
@@ -506,6 +550,7 @@ def train_stack_pipeline(
     seed: int,
     study_tag: str,
 ):
+    # Train experts first, then build OOF meta features, then tune the multiclass meta model.
     experts, expert_param_map = train_expert_models(x_train, target_train, seed=seed, study_tag=study_tag)
     meta_oof = build_oof_meta_features(x_train, target_train, expert_param_map, seed=seed + 200)
     selected_original_cols, core_cols, supp_cols = select_meta_original_features(x_train, y_train, seed=seed + 300)
@@ -519,7 +564,7 @@ def train_stack_pipeline(
     return experts, meta_model, selected_original_cols, core_cols, supp_cols
 
 
-def reference_five_fold_evaluation(
+def five_fold_evaluation(
     x: pd.DataFrame,
     y_true: np.ndarray,
     experts: Dict[str, dict],
@@ -530,6 +575,7 @@ def reference_five_fold_evaluation(
     rng = np.random.RandomState(seed)
     n_splits = 5
     fold_buckets = [[] for _ in range(n_splits)]
+    # Construct class-balanced folds manually to avoid sklearn warnings on ultra-rare classes.
     for cls in np.unique(y_true):
         cls_idx = np.where(y_true == cls)[0]
         rng.shuffle(cls_idx)
@@ -552,6 +598,7 @@ def reference_five_fold_evaluation(
         y_val = y_true[idx_va]
 
         x_meta_val = build_meta_input_for_prediction(x_val, experts, selected_original_cols)
+        # Align validation columns to the trained meta model feature order.
         x_meta_val = x_meta_val.reindex(columns=meta_model.feature_name_, fill_value=0.0)
         y_pred_primary = meta_model.predict(x_meta_val).astype(int)
         y_pred_logic = apply_logic_correction(y_pred_primary, x_val)
@@ -571,6 +618,7 @@ def reference_five_fold_evaluation(
 
 
 def evaluate_binary(y_true: np.ndarray, y_pred: np.ndarray, normal_label: int):
+    # Collapse eight classes into normal vs abnormal to match the binary report in the paper.
     y_true_bin = (y_true != normal_label).astype(int)
     y_pred_bin = (y_pred != normal_label).astype(int)
     p, r, f1, _ = precision_recall_fscore_support(y_true_bin, y_pred_bin, average="binary", zero_division=0)
@@ -579,6 +627,7 @@ def evaluate_binary(y_true: np.ndarray, y_pred: np.ndarray, normal_label: int):
 
 
 def evaluate_multiclass(y_true: np.ndarray, y_pred: np.ndarray):
+    # Compute per-class and macro metrics under a fixed class index order.
     labels = list(range(len(CLASS_NAMES)))
     p, r, f1, sup = precision_recall_fscore_support(y_true, y_pred, labels=labels, zero_division=0)
     macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(y_true, y_pred, average="macro", zero_division=0)
@@ -596,6 +645,7 @@ def evaluate_multiclass(y_true: np.ndarray, y_pred: np.ndarray):
 
 
 def print_binary_report(binary_metrics: dict, title: str):
+    # Keep the binary summary compact because it is read together with the multiclass table below.
     print(f"\n{title} Binary Evaluation (Normal vs Abnormal)")
     print(f"Accuracy : {binary_metrics['accuracy']:.4f}")
     print(f"Precision: {binary_metrics['precision']:.4f}")
@@ -604,6 +654,7 @@ def print_binary_report(binary_metrics: dict, title: str):
 
 
 def print_multiclass_table(metrics: dict, total_samples: int, title: str):
+    # Print a deterministic class-order table so runs are easy to compare line by line.
     print(f"\n{title} Eight-Class Evaluation Summary")
     print(f"{'Class':<14}{'Precision':<12}{'Recall':<12}{'F1-score':<12}{'Support':<10}")
     print("-" * 62)
@@ -618,6 +669,7 @@ def print_multiclass_table(metrics: dict, total_samples: int, title: str):
 
 
 def print_confusion(y_true: np.ndarray, y_pred: np.ndarray, title: str):
+    # Render confusion matrix with named rows/columns for direct error-pattern inspection.
     cm = confusion_matrix(y_true, y_pred, labels=list(range(len(CLASS_NAMES))))
     cm_df = pd.DataFrame(cm, index=CLASS_NAMES, columns=CLASS_NAMES)
     print(f"\n{title} Confusion Matrix")
@@ -625,6 +677,7 @@ def print_confusion(y_true: np.ndarray, y_pred: np.ndarray, title: str):
 
 
 def report_results(title: str, y_true: np.ndarray, y_pred: np.ndarray, normal_label: int):
+    # Bundle all report outputs so evaluation formatting stays consistent across workflows.
     binary_metrics = evaluate_binary(y_true, y_pred, normal_label=normal_label)
     multiclass_metrics = evaluate_multiclass(y_true, y_pred)
     print_binary_report(binary_metrics, title=title)
@@ -642,20 +695,34 @@ def persist_models(
     selected_original_cols: list[str],
     scaler: StandardScaler,
 ):
-    MODEL_DIR.mkdir(parents=True, exist_ok=True)
-    for k, pack in experts.items():
-        save_path = MODEL_DIR / f"{k}_expert.pkl"
-        with open(save_path, "wb") as f:
-            pickle.dump(pack["model"], f)
-    with open(MODEL_DIR / "meta_model.pkl", "wb") as f:
-        pickle.dump(meta_model, f)
-    with open(MODEL_DIR / "meta_original_cols.pkl", "wb") as f:
-        pickle.dump(selected_original_cols, f)
-    with open(MODEL_DIR / "scaler.pkl", "wb") as f:
-        pickle.dump(scaler, f)
+    ensure_q4_output_dir()
+    # Save one compact bundle to reduce file clutter while preserving all inference artifacts.
+    bundle = {
+        "experts": {k: pack["model"] for k, pack in experts.items()},
+        "meta_model": meta_model,
+        "meta_original_cols": list(selected_original_cols),
+        "scaler": scaler,
+        "class_names": list(CLASS_NAMES),
+        "study_prefix": STUDY_PREFIX,
+    }
+    with open(MODEL_BUNDLE_PATH, "wb") as f:
+        pickle.dump(bundle, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def compact_optuna_sqlite():
+    # Run VACUUM after training to shrink the sqlite file produced by repeated Optuna runs.
+    if not OPTUNA_DB_PATH.exists():
+        return
+    try:
+        with sqlite3.connect(OPTUNA_DB_PATH) as conn:
+            conn.execute("VACUUM;")
+    except sqlite3.Error:
+        # Keep training/reporting robust even if the local sqlite file is temporarily locked.
+        pass
 
 
 def main():
+    ensure_q4_output_dir()
     print("[Step 1] build modeling data")
     df_raw = pd.read_csv(DATA_PATH, encoding="utf-8")
     x_raw, y_idx, target_df = build_modeling_data(df_raw)
@@ -663,6 +730,7 @@ def main():
 
     print("[Step 2] full-data training")
     scaler_full = StandardScaler()
+    # Scale only numeric feature columns once and keep the fitted scaler for future prediction.
     x_full = pd.DataFrame(scaler_full.fit_transform(x_raw), columns=x_raw.columns, index=x_raw.index)
     experts_full, meta_model_full, selected_original_cols, core_cols, supp_cols = train_stack_pipeline(
         x_full,
@@ -675,8 +743,9 @@ def main():
     print(f"Meta supplementary RFE features: {len(supp_cols)}")
     persist_models(experts_full, meta_model_full, selected_original_cols, scaler_full)
 
-    print("\n[Step 3] 5-fold CV evaluation (reference style)")
-    y_true_cv, y_pred_cv, fold_acc, fold_macro_f1, actual_folds = reference_five_fold_evaluation(
+    print("\n[Step 3] 5-fold CV evaluation")
+    # Evaluate with a fixed 5-fold split over the full-data-trained pipeline for reproducible reporting.
+    y_true_cv, y_pred_cv, fold_acc, fold_macro_f1, actual_folds = five_fold_evaluation(
         x_full,
         y_idx,
         experts_full,
@@ -695,7 +764,9 @@ def main():
     y_pred_full_primary = meta_model_full.predict(x_meta_full).astype(int)
     y_pred_full = apply_logic_correction(y_pred_full_primary, x_full)
     report_results("Full-Data Fit", y_idx, y_pred_full, normal_label)
+    compact_optuna_sqlite()
 
 
 if __name__ == "__main__":
     main()
+

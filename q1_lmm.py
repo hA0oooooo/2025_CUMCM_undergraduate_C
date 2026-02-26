@@ -1,12 +1,10 @@
-"""
+﻿"""
 Q1: mixed-effects model for FF with GA and BMI.
 
-Learning-oriented notes:
-1) Response is logit(FF), so the linear mixed model operates on an unconstrained scale.
-2) Fixed effects include centered GA/BMI and their quadratic terms.
-3) Random effects include subject-specific intercept and GA slope.
+summary:
+1) Fit a mixed-effects model on logit(FF) with GA/BMI fixed effects and subject random effects.
+2) Report coefficients and model diagnostics.
 """
-
 import warnings
 from pathlib import Path
 
@@ -26,6 +24,7 @@ COL_SUBJECT = "孕妇代码"
 
 def load_and_clean():
     """Load raw data, keep core columns, and build centered polynomial terms."""
+    # Keep only the columns used by the mixed model to make downstream assumptions explicit.
     df = pd.read_csv(DATA_PATH, encoding="utf-8")
     df = df[[COL_SUBJECT, COL_GA, COL_BMI, COL_FF]].copy()
     df = df.dropna(subset=[COL_GA, COL_BMI, COL_FF])
@@ -35,6 +34,7 @@ def load_and_clean():
 
     ga_bar = float(df[COL_GA].mean())
     bmi_bar = float(df[COL_BMI].mean())
+    # Centering reduces collinearity when adding quadratic terms to the fixed-effects design.
     df["GA_c"] = df[COL_GA] - ga_bar
     df["BMI_c"] = df[COL_BMI] - bmi_bar
     df["GA_c2"] = df["GA_c"] ** 2
@@ -50,6 +50,7 @@ def set_logit_response(df):
 
 def build_design(df):
     """Build fixed/random design matrices used by statsmodels MixedLM."""
+    # Match the fixed-effects specification used in the modeling report.
     exog = pd.DataFrame(
         {
             "const": 1.0,
@@ -59,6 +60,7 @@ def build_design(df):
             "BMI_c2": df["BMI_c2"],
         }
     )
+    # Random effects include subject intercept and subject-specific GA slope.
     exog_re = np.column_stack([np.ones(len(df)), df["GA_c"].values])
     return exog, exog_re
 
@@ -83,8 +85,10 @@ def print_correlation(df):
 def fit_full_model(df):
     """Fit mixed model with random intercept + GA_c slope using ML."""
     exog, exog_re = build_design(df)
+    # Use subject ID as the grouping key so repeated tests share the same random effects.
     model = MixedLM(df["y"], exog, groups=df[COL_SUBJECT], exog_re=exog_re)
     with warnings.catch_warnings():
+        # Silence common optimization warnings to keep console output focused on model results.
         warnings.filterwarnings("ignore", message=".*boundary.*")
         warnings.filterwarnings("ignore", message=".*[Cc]onverge.*")
         warnings.filterwarnings("ignore", message=".*[Rr]etrying.*")
@@ -99,6 +103,7 @@ def conditional_r2(result, exog, exog_re):
     var_fixed = float(np.var(exog.values @ beta))
     z = np.asarray(exog_re)
     cov_re = np.asarray(result.cov_re)
+    # Compute the average random-effect variance contribution across observations.
     var_random = float(np.mean(np.sum(z * (z @ cov_re), axis=1)))
     sigma2_e = float(result.scale)
     var_total = var_fixed + var_random + sigma2_e
@@ -112,6 +117,7 @@ def r2_ff(result, df, exog, exog_re):
     z = np.asarray(exog_re)
     groups = df[COL_SUBJECT].values
     re_dict = result.random_effects
+    # Add subject-level BLUP random effects to build fitted values on the logit scale.
     for i, g in enumerate(groups):
         eta[i] += float(np.dot(z[i], re_dict[g]))
     ff_pred = np.exp(eta) / (1.0 + np.exp(eta))
@@ -127,6 +133,7 @@ def icc(result, ga_c_values):
     sigma2_b = float(cov_re[1, 1])
     var_ga_c = float(np.var(ga_c_values))
     sigma2_e = float(result.scale)
+    # Approximate the average within-subject correlation by integrating the random slope over observed GA spread.
     num = sigma2_u + sigma2_b * var_ga_c
     return num / (num + sigma2_e)
 
@@ -135,6 +142,7 @@ def ame_ga(result, ff_values):
     """Average marginal effect of GA on FF scale."""
     beta = result.fe_params
     ff = np.asarray(ff_values, dtype=float)
+    # Transform the GA coefficient from logit scale to FF scale using the logistic derivative.
     return float(np.mean(beta["GA_c"] * ff * (1.0 - ff)))
 
 
@@ -144,6 +152,7 @@ def main():
     set_logit_response(df)
     print("\nTransform: logit(FF); covariates: GA_c, BMI_c")
 
+    # Fit once and reuse the same result object for all reported statistics.
     result, exog, exog_re = fit_full_model(df)
 
     fe = result.fe_params
@@ -155,6 +164,7 @@ def main():
     for t in fe.index:
         print(f"{t:<{w_term}}{fe[t]:>{w_est}.6f}{se[t]:>{w_se}.6f}{pvals[t]:>{w_p}.4f}")
 
+    # Statsmodels may return covariance in a matrix-like object, so normalize to ndarray for safe indexing.
     cov_re = np.atleast_2d(result.cov_re)
     sigma2_e = float(result.scale)
     print("\nRandom effects (variance components)")
@@ -176,3 +186,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
