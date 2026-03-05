@@ -50,7 +50,7 @@ def set_logit_response(df):
 
 def build_design(df):
     """Build fixed/random design matrices used by statsmodels MixedLM."""
-    # Match the fixed-effects specification used in the modeling report.
+    # Match the fixed-effects specification.
     exog = pd.DataFrame(
         {
             "const": 1.0,
@@ -186,5 +186,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
